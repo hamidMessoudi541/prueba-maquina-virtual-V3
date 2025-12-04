@@ -1,313 +1,113 @@
-name: Bazzite Gaming RDP - 1920x1080 60Hz
+name: RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      tailscale_key:
-        description: 'Tailscale Auth Key (required)'
-        required: true
-      duration:
-        description: 'Session hours (1-6)'
-        required: false
-        default: '4'
-
-env:
-  TAILSCALE_KEY: ${{ github.event.inputs.tailscale_key }}
-  DURATION_HOURS: ${{ github.event.inputs.duration || 4 }}
 
 jobs:
-  bazzite-gaming-rdp:
-    runs-on: ubuntu-latest
-    timeout-minutes: ${{ env.DURATION_HOURS * 60 + 30 }}
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-    - name: Setup environment
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y qemu-system-x86 qemu-utils
-        mkdir -p ~/bazzite-vm
-        cd ~/bazzite-vm
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-    - name: Download Bazzite
-      run: |
-        echo "Downloading Bazzite..."
-        wget -q --show-progress \
-          -O bazzite.iso \
-          https://github.com/ublue-os/bazzite/releases/latest/download/bazzite-gnome-x86_64.iso
-        echo "Image downloaded: $(ls -lh bazzite.iso)"
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-    - name: Create virtual disk
-      run: |
-        qemu-img create -f qcow2 bazzite.qcow2 80G
-        echo "Virtual disk created (80GB)"
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-    - name: Start Bazzite VM
-      run: |
-        sudo qemu-system-x86_64 \
-          -name "Bazzite Gaming" \
-          -machine type=q35,accel=kvm \
-          -cpu host \
-          -smp 8 \
-          -m 12G \
-          -drive file=bazzite.qcow2,if=virtio,cache=writeback,format=qcow2 \
-          -cdrom bazzite.iso \
-          -boot d \
-          -vga virtio \
-          -display none \
-          -netdev user,id=n1,hostfwd=tcp::3389-:3389,hostfwd=tcp::2222-:22 \
-          -device virtio-net-pci,netdev=n1 \
-          -rtc base=localtime,clock=host \
-          -daemonize
-        
-        echo "VM started"
-        sleep 60
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-    - name: Configure Bazzite automatically
-      run: |
-        sudo apt-get install -y expect
-        
-        cat > setup-bazzite.exp << 'EOF'
-#!/usr/bin/expect -f
-set timeout 300
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-spawn ssh -o StrictHostKeyChecking=no -p 2222 localhost
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-expect "localhost's password:"
-send "bazzite\r"
-
-expect "$ "
-
-send "sudo rpm-ostree update -y\r"
-expect "password for bazzite:"
-send "bazzite\r"
-expect "# "
-
-send "cat > /etc/X11/xorg.conf.d/10-resolution.conf << 'RES_CONFIG'\r"
-send "Section \"Monitor\"\r"
-send "    Identifier \"Virtual-1\"\r"
-send "    Modeline \"1920x1080_60.00\" 173.00 1920 2048 2248 2576 1080 1083 1088 1120 -hsync +vsync\r"
-send "    Option \"PreferredMode\" \"1920x1080_60.00\"\r"
-send "EndSection\r"
-send "\r"
-send "Section \"Screen\"\r"
-send "    Identifier \"Screen0\"\r"
-send "    Monitor \"Virtual-1\"\r"
-send "    DefaultDepth 24\r"
-send "    SubSection \"Display\"\r"
-send "        Depth 24\r"
-send "        Modes \"1920x1080\"\r"
-send "    EndSubSection\r"
-send "EndSection\r"
-send "RES_CONFIG\r"
-
-expect "$ "
-
-send "cat > ~/.config/monitors.xml << 'MONITOR_XML'\r"
-send "<monitors version=\"2\">\r"
-send "  <configuration>\r"
-send "    <logicalmonitor>\r"
-send "      <x>0</x>\r"
-send "      <y>0</y>\r"
-send "      <scale>1</scale>\r"
-send "      <primary>yes</primary>\r"
-send "      <monitor>\r"
-send "        <monitorspec>\r"
-send "          <connector>Virtual-1</connector>\r"
-send "          <vendor>unknown</vendor>\r"
-send "          <product>unknown</product>\r"
-send "          <serial>unknown</serial>\r"
-send "        </monitorspec>\r"
-send "        <mode>\r"
-send "          <width>1920</width>\r"
-send "          <height>1080</height>\r"
-send "          <rate>60</rate>\r"
-send "        </mode>\r"
-send "      </monitor>\r"
-send "    </logicalmonitor>\r"
-send "  </configuration>\r"
-send "</monitors>\r"
-send "MONITOR_XML\r"
-
-expect "$ "
-
-send "curl -fsSL https://tailscale.com/install.sh | sh\r"
-expect "$ "
-send "sudo tailscale up --authkey=$env(TAILSCALE_KEY) --hostname=bazzite-gaming-$env(GITHUB_RUN_ID)\r"
-expect "$ "
-
-send "TS_IP=$(tailscale ip --4)\r"
-expect "$ "
-send "echo 'TAILSCALE_IP='$TS_IP > /tmp/tailscale-info.txt\r"
-expect "$ "
-
-send "flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo\r"
-expect "$ "
-send "flatpak install -y flathub com.valvesoftware.Steam\r"
-expect "$ "
-
-send "sudo rpm-ostree install -y xrdp xorgxrdp\r"
-expect "$ "
-
-send "echo 'gnome-session' > ~/.xsession\r"
-expect "$ "
-send "sudo systemctl enable --now xrdp\r"
-expect "$ "
-
-send "sudo firewall-cmd --permanent --add-port=3389/tcp\r"
-expect "$ "
-send "sudo firewall-cmd --reload\r"
-expect "$ "
-
-send "sudo useradd -m -G wheel -s /bin/bash gamer\r"
-expect "$ "
-send "echo 'gamer:gamer123' | sudo chpasswd\r"
-expect "$ "
-send "echo 'gamer ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/gamer\r"
-expect "$ "
-
-send "gsettings set org.gnome.desktop.interface enable-animations false\r"
-expect "$ "
-
-send "sudo mkdir -p /etc/gdm\r"
-expect "$ "
-send "echo '[daemon]' | sudo tee /etc/gdm/custom.conf\r"
-expect "$ "
-send "echo 'AutomaticLoginEnable=true' | sudo tee -a /etc/gdm/custom.conf\r"
-expect "$ "
-send "echo 'AutomaticLogin=gamer' | sudo tee -a /etc/gdm/custom.conf\r"
-expect "$ "
-
-send "exit\r"
-expect eof
-EOF
-        
-        chmod +x setup-bazzite.exp
-        ./setup-bazzite.exp
-
-    - name: Verify configuration
-      run: |
-        TS_IP=$(ssh -o StrictHostKeyChecking=no -p 2222 localhost "cat /tmp/tailscale-info.txt 2>/dev/null | grep TAILSCALE_IP | cut -d= -f2")
-        echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-        
-        echo "Checking services..."
-        ssh -o StrictHostKeyChecking=no -p 2222 localhost "systemctl is-active xrdp && echo 'xrdp active' || echo 'xrdp inactive'"
-        ssh -o StrictHostKeyChecking=no -p 2222 localhost "tailscale status && echo 'Tailscale active' || echo 'Tailscale inactive'"
-
-    - name: Show connection info
-      run: |
-        echo "===================================================="
-        echo "BAZZITE GAMING RDP - CONFIGURATION COMPLETE"
-        echo "===================================================="
-        echo ""
-        echo "SYSTEM CONFIGURED:"
-        echo "• OS: Bazzite Linux (Fedora Gaming)"
-        echo "• Resolution: 1920x1080 @ 60Hz"
-        echo "• RAM: 12GB"
-        echo "• CPU: 8 cores"
-        echo "• Storage: 80GB"
-        echo ""
-        echo "TAILSCALE CONNECTION:"
-        echo "• IP: ${{ env.TAILSCALE_IP }}"
-        echo "• Hostname: bazzite-gaming-${{ github.run_id }}"
-        echo ""
-        echo "RDP CONNECTION:"
-        echo "1. Open Remote Desktop Connection"
-        echo "2. Address: ${{ env.TAILSCALE_IP }}"
-        echo "3. Port: 3389"
-        echo "4. Username: gamer"
-        echo "5. Password: gamer123"
-        echo ""
-        echo "STEAM INSTALLED:"
-        echo "• Version: Flatpak"
-        echo "• To launch: Search 'Steam' in applications menu"
-        echo ""
-        echo "SSH ACCESS (alternative):"
-        echo "ssh -p 2222 gamer@localhost"
-        echo "Password: gamer123"
-        echo ""
-        echo "SESSION DURATION: ${{ env.DURATION_HOURS }} hours"
-        echo "===================================================="
-
-    - name: Create RDP connection file
-      run: |
-        cat > connect-bazzite.rdp << EOF
-full address:s:${{ env.TAILSCALE_IP }}
-username:s:gamer
-desktopwidth:i:1920
-desktopheight:i:1080
-session bpp:i:32
-compression:i:1
-keyboardhook:i:2
-audiocapturemode:i:0
-videoplaybackmode:i:1
-connection type:i:7
-networkautodetect:i:1
-bandwidthautodetect:i:1
-displayconnectionbar:i:1
-enableworkspacereconnect:i:0
-disable wallpaper:i:1
-allow font smoothing:i:1
-allow desktop composition:i:1
-disable full window drag:i:1
-disable menu anims:i:1
-disable themes:i:0
-disable cursor setting:i:0
-bitmapcachepersistenable:i:1
-audiomode:i:0
-redirectprinters:i:1
-redirectcomports:i:0
-redirectsmartcards:i:1
-redirectwebauthn:i:1
-redirectclipboard:i:1
-redirectposdevices:i:0
-autoreconnection enabled:i:1
-authentication level:i:2
-prompt for credentials:i:0
-negotiate security layer:i:1
-remoteapplicationmode:i:0
-alternate shell:s:
-shell working directory:s:
-gatewayhostname:s:
-gatewayusagemethod:i:4
-gatewaycredentialssource:i:4
-gatewayprofileusagemethod:i:0
-promptcredentialonce:i:1
-gatewaybrokeringtype:i:0
-use redirection server name:i:0
-rdgiskdcproxy:i:0
-kdcproxyname:s:
-drivestoredirect:s:*
-EOF
-        
-        echo "RDP file generated: connect-bazzite.rdp"
-
-    - name: Keep session active
-      run: |
-        echo "Keeping session active for ${{ env.DURATION_HOURS }} hours..."
-        echo "Connect via RDP to: ${{ env.TAILSCALE_IP }}"
-        echo ""
-        echo "Press Ctrl+C in GitHub to terminate session"
-        
-        DURATION=$((DURATION_HOURS * 3600))
-        
-        for i in $(seq 1 $DURATION); do
-          if [ $((i % 300)) -eq 0 ]; then
-            MINUTES=$((i / 60))
-            echo "Session active: ${MINUTES} minutes"
-          fi
-          sleep 1
-        done
-
-    - name: Cleanup
-      if: always()
-      run: |
-        echo "Cleaning resources..."
-        
-        sudo pkill -f qemu-system || true
-        sleep 5
-        
-        cd ~
-        rm -rf bazzite-vm
-        
-        echo "Resources released"
-        echo "Session ended"
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
